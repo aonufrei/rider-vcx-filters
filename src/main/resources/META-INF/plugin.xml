@@ -1,0 +1,19 @@
+<idea-plugin>
+    <id>com.example.vcxfilters</id>
+    <name>VCXProj Filters Explorer</name>
+    <vendor>Local</vendor>
+    <description><![CDATA[
+        Adds a "Filters" tool window that shows the Visual C++ solution layout the way Visual Studio does:
+        solutions, projects and the virtual folders (filters) defined in <code>*.vcxproj.filters</code>.
+    ]]></description>
+
+    <depends>com.intellij.modules.rider</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="Filters Explorer"
+                    anchor="left"
+                    secondary="false"
+                    icon="AllIcons.Nodes.Folder"
+                    factoryClass="com.example.vcxfilters.ui.FiltersToolWindowFactory"/>
+    </extensions>
+</idea-plugin>
