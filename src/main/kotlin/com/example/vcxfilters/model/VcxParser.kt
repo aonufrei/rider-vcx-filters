@@ -27,8 +27,10 @@ object VcxParser {
 
     private val cache = ConcurrentHashMap<Path, Cached>()
 
-    /** Finds every solution below [root] and nests each one under the closest solution in a parent directory. */
-    fun findSolutions(root: Path): List<VcxSolution> {
+    /** The solution and project files found on disk. Walking a large tree is the slow part, so callers can keep this. */
+    class Scan(val solutions: List<Path>, val projects: List<Path>)
+
+    fun scan(root: Path): Scan {
         val slns = mutableListOf<Path>()
         val projects = mutableListOf<Path>()
         Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
@@ -37,19 +39,33 @@ object VcxParser {
                 else FileVisitResult.CONTINUE
 
             override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                val n = file.fileName.toString().lowercase()
-                if (n.endsWith(".sln")) slns.add(file) else if (n.endsWith(".vcxproj")) projects.add(file)
+                val n = file.fileName.toString()
+                if (n.endsWith(".sln", ignoreCase = true)) slns.add(file)
+                else if (n.endsWith(".vcxproj", ignoreCase = true)) projects.add(file)
                 return FileVisitResult.CONTINUE
             }
 
             override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
         })
+        return Scan(slns.sorted(), projects.sorted())
+    }
 
-        if (slns.isEmpty()) {
-            return if (projects.isEmpty()) emptyList()
-            else listOf(VcxSolution("(no solution)", null, projects.sorted().mapNotNull { parseProject(it, null) }))
+    private class RawSolution(val file: Path, val projects: List<Pair<String, Path>>)
+
+    /** Reads the solutions and projects of [scan] and nests each solution under the closest one in a parent directory. */
+    fun build(scan: Scan): List<VcxSolution> {
+        if (scan.solutions.isEmpty()) {
+            if (scan.projects.isEmpty()) return emptyList()
+            scan.projects.parallelStream().forEach { parseProject(it, null) }
+            return listOf(VcxSolution("(no solution)", null, scan.projects.mapNotNull { parseProject(it, null) }))
         }
-        return nest(slns.sorted().map { parseSolution(it) })
+        val raw = scan.solutions.map { readSolution(it) }
+        // Many solutions share projects, and each project is parsed once; do the parsing in parallel.
+        raw.flatMap { r -> r.projects.map { it.second } }.distinct().parallelStream().forEach { parseProject(it, null) }
+        val all = raw.map { r ->
+            VcxSolution(r.file.fileName.toString().removeSuffix(".sln"), r.file, r.projects.mapNotNull { (n, p) -> parseProject(p, n) })
+        }
+        return nest(all)
     }
 
     private fun nest(all: List<VcxSolution>): List<VcxSolution> {
@@ -64,7 +80,7 @@ object VcxParser {
         return roots
     }
 
-    fun parseSolution(sln: Path): VcxSolution {
+    private fun readSolution(sln: Path): RawSolution {
         val dir = sln.parent
         val projects = try {
             Files.readAllLines(sln).mapNotNull { line ->
@@ -72,12 +88,12 @@ object VcxParser {
                 val rel = m.groupValues[2]
                 if (!rel.endsWith(".vcxproj", ignoreCase = true)) return@mapNotNull null
                 val file = dir.resolve(rel.replace('\\', '/')).normalize()
-                if (!Files.isRegularFile(file)) null else parseProject(file, m.groupValues[1])
+                if (!Files.isRegularFile(file)) null else m.groupValues[1] to file
             }
         } catch (_: Exception) {
             emptyList()
         }
-        return VcxSolution(sln.fileName.toString().removeSuffix(".sln"), sln, projects)
+        return RawSolution(sln, projects)
     }
 
     fun parseProject(vcxproj: Path, name: String?): VcxProject? {
