@@ -4,6 +4,7 @@ import org.w3c.dom.Document
 import org.w3c.dom.Element
 import org.w3c.dom.Node
 import org.w3c.dom.Text
+import java.io.StringWriter
 import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
@@ -13,18 +14,76 @@ import javax.xml.transform.OutputKeys
 import javax.xml.transform.TransformerFactory
 import javax.xml.transform.dom.DOMSource
 import javax.xml.transform.stream.StreamResult
-import java.io.StringWriter
 
 /**
- * Rewrites a .vcxproj.filters file so that files belong to another filter. It works on the DOM and keeps
- * everything it does not touch (comments, whitespace, BOM, line endings, the XML declaration).
+ * Rewrites a .vcxproj.filters file. It works on the DOM and keeps everything it does not touch
+ * (comments, whitespace, BOM, line endings, the XML declaration).
+ *
+ * Every operation takes the current bytes of the file (null when the project has none yet) and returns the new bytes.
+ * Filter names are written the way MSBuild expects them: segments separated by a backslash.
  */
 object FiltersEditor {
     private const val MSBUILD_NS = "http://schemas.microsoft.com/developer/msbuild/2003"
     private val BOM = byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte())
 
-    /** @param original current bytes of the .filters file, or null when the project has none yet. */
-    fun moveFiles(original: ByteArray?, filtersFile: Path, files: List<FileEntry>, targetFilter: String): ByteArray {
+    fun read(path: Path): ByteArray? = if (Files.isRegularFile(path)) Files.readAllBytes(path) else null
+
+    fun moveFiles(original: ByteArray?, filtersFile: Path, files: List<FileEntry>, targetFilter: String): ByteArray =
+        edit(original) { doc, project ->
+            val dir = filtersFile.parent
+            val filter = targetFilter.trim('\\')
+            if (filter.isNotEmpty()) ensureFilter(doc, project, filter)
+
+            val byPath = HashMap<Path, Element>()
+            for (item in fileItems(project)) {
+                byPath[dir.resolve(item.getAttribute("Include").replace('\\', '/')).normalize()] = item
+            }
+            for (entry in files) {
+                var item = byPath[entry.path]
+                if (item == null) {
+                    if (filter.isEmpty()) continue
+                    item = doc.createElement(entry.itemType).apply { setAttribute("Include", entry.include) }
+                    val group = childElements(project, "ItemGroup")
+                        .lastOrNull { g -> childElements(g, entry.itemType).isNotEmpty() }
+                        ?: newItemGroup(doc, project, atStart = false)
+                    append(group, item, "    ", "  ")
+                }
+                setItemFilter(doc, item, filter)
+            }
+        }
+
+    fun addFilter(original: ByteArray?, name: String): ByteArray =
+        edit(original) { doc, project -> ensureFilter(doc, project, name.trim('\\')) }
+
+    /** Renames [oldName] (and everything below it) to [newName]. */
+    fun renameFilter(original: ByteArray?, oldName: String, newName: String): ByteArray =
+        edit(original) { doc, project ->
+            rewritePrefix(project, oldName, newName)
+            removeDuplicateFilters(project)
+        }
+
+    /**
+     * Removes the filter [name]. Its files move up into the parent filter (or the project root) and its
+     * sub-filters move up one level, as in Visual Studio.
+     */
+    fun removeFilter(original: ByteArray?, name: String): ByteArray =
+        edit(original) { doc, project ->
+            val parent = name.substringBeforeLast('\\', "")
+            for (group in childElements(project, "ItemGroup")) {
+                for (el in childElements(group, "Filter")) {
+                    if (el.getAttribute("Include").equals(name, ignoreCase = true)) removeNode(el)
+                }
+            }
+            // The filter itself is gone; sub-filters and files inside it take the parent's place.
+            for (item in fileItems(project)) {
+                val f = childElements(item, "Filter").firstOrNull() ?: continue
+                if (f.textContent.trim().equals(name, ignoreCase = true)) setItemFilter(doc, item, parent)
+            }
+            rewritePrefix(project, name, parent, childrenOnly = true)
+            removeDuplicateFilters(project)
+        }
+
+    private fun edit(original: ByteArray?, block: (Document, Element) -> Unit): ByteArray {
         val text = original?.let { String(it, StandardCharsets.UTF_8).removePrefix("﻿") }
         val hasBom = original != null && original.size >= 3 && original.copyOfRange(0, 3).contentEquals(BOM)
         val crlf = text?.contains("\r\n") ?: true
@@ -43,31 +102,7 @@ object FiltersEditor {
                 })
             }
         }
-        val project = doc.documentElement
-        val dir = filtersFile.parent
-
-        val filter = targetFilter.trim('\\')
-        if (filter.isNotEmpty()) ensureFilter(doc, project, filter)
-
-        val byPath = HashMap<Path, Element>()
-        for (group in childElements(project, "ItemGroup")) {
-            for (item in childElements(group, null)) {
-                if (item.tagName == "Filter" || !item.hasAttribute("Include")) continue
-                byPath[dir.resolve(item.getAttribute("Include").replace('\\', '/')).normalize()] = item
-            }
-        }
-
-        for (entry in files) {
-            var item = byPath[entry.path]
-            if (item == null) {
-                if (filter.isEmpty()) continue
-                item = doc.createElement(entry.itemType).apply { setAttribute("Include", entry.include) }
-                val group = childElements(project, "ItemGroup").lastOrNull { g -> childElements(g, entry.itemType).isNotEmpty() }
-                    ?: newItemGroup(doc, project, atStart = false)
-                append(group, item, "    ", "  ")
-            }
-            setItemFilter(doc, item, filter)
-        }
+        block(doc, doc.documentElement)
 
         val body = StringWriter().also {
             TransformerFactory.newInstance().newTransformer().apply {
@@ -82,15 +117,54 @@ object FiltersEditor {
         return if (hasBom || original == null) BOM + bytes else bytes
     }
 
-    fun read(path: Path): ByteArray? = if (Files.isRegularFile(path)) Files.readAllBytes(path) else null
+    private fun fileItems(project: Element): List<Element> =
+        childElements(project, "ItemGroup").flatMap { childElements(it, null) }
+            .filter { it.tagName != "Filter" && it.hasAttribute("Include") }
+
+    /** Replaces the leading [old] segments of every filter name and every item's filter with [new]. */
+    private fun rewritePrefix(project: Element, old: String, new: String, childrenOnly: Boolean = false) {
+        fun rewrite(name: String): String? {
+            if (name.equals(old, ignoreCase = true)) return if (childrenOnly) null else new
+            if (name.startsWith("$old\\", ignoreCase = true)) {
+                val rest = name.substring(old.length + 1)
+                return if (new.isEmpty()) rest else "$new\\$rest"
+            }
+            return null
+        }
+        for (group in childElements(project, "ItemGroup")) {
+            for (el in childElements(group, null)) {
+                if (el.tagName == "Filter") {
+                    rewrite(el.getAttribute("Include"))?.let { el.setAttribute("Include", it) }
+                } else {
+                    val f = childElements(el, "Filter").firstOrNull() ?: continue
+                    rewrite(f.textContent.trim())?.let { f.textContent = it }
+                }
+            }
+        }
+    }
+
+    /** Merging filters can leave two definitions with the same name; keep the first. */
+    private fun removeDuplicateFilters(project: Element) {
+        val seen = HashSet<String>()
+        for (group in childElements(project, "ItemGroup")) {
+            for (el in childElements(group, "Filter")) {
+                if (!seen.add(el.getAttribute("Include").lowercase())) removeNode(el)
+            }
+        }
+    }
+
+    private fun removeNode(el: Element) {
+        val parent = el.parentNode
+        val prev = el.previousSibling
+        if (prev is Text && prev.data.isBlank()) parent.removeChild(prev)
+        parent.removeChild(el)
+    }
 
     private fun setItemFilter(doc: Document, item: Element, filter: String) {
         val existing = childElements(item, "Filter").firstOrNull()
         when {
             existing != null && filter.isEmpty() -> {
-                val prev = existing.previousSibling
-                if (prev is Text && prev.data.isBlank()) item.removeChild(prev)
-                item.removeChild(existing)
+                removeNode(existing)
                 if (childElements(item, null).isEmpty()) while (item.firstChild != null) item.removeChild(item.firstChild)
             }
             existing != null -> existing.textContent = filter

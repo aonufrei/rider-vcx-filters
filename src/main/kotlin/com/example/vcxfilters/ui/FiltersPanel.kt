@@ -26,7 +26,9 @@ import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.InputValidator
 import com.intellij.openapi.ui.MessageType
+import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.ui.SimpleToolWindowPanel
 import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.vfs.LocalFileSystem
@@ -51,6 +53,7 @@ import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.nio.file.Path
 import javax.swing.DropMode
+import javax.swing.Icon
 import javax.swing.JComponent
 import javax.swing.JTree
 import javax.swing.TransferHandler
@@ -100,7 +103,16 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
                 if (e.keyCode == KeyEvent.VK_ENTER) openSelected()
             }
         })
-        PopupHandler.installPopupMenu(tree, DefaultActionGroup(OpenAction()), "VcxFiltersPopup")
+        PopupHandler.installPopupMenu(
+            tree,
+            DefaultActionGroup(
+                OpenAction(),
+                NodeAction("New Filter...", AllIcons.General.Add, { it is Item.Project || it is Item.Dir }) { newFilter() },
+                NodeAction("Rename Filter...", null, { it is Item.Dir }) { renameFilter() },
+                NodeAction("Remove Filter", AllIcons.General.Remove, { it is Item.Dir }) { removeFilter() },
+            ),
+            "VcxFiltersPopup",
+        )
 
         setContent(ScrollPaneFactory.createScrollPane(tree))
         val group = DefaultActionGroup(
@@ -286,17 +298,23 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
     }
 
     private fun moveFiles(files: List<DefaultMutableTreeNode>, target: DefaultMutableTreeNode) {
-        val prjNode = projectNodeOf(target) ?: return
-        val prj = (prjNode.userObject as Item.Project).project
+        val prj = projectOf(target) ?: return
         val entries = files.map { (it.userObject as Item.File).entry }
         val filter = filterPathOf(target)
-        val filtersFile = prj.filtersFile
+        editFilters(prj, expand = target) { FiltersEditor.moveFiles(it, prj.filtersFile, entries, filter) }
+    }
 
+    private fun projectOf(node: DefaultMutableTreeNode): VcxProject? =
+        (projectNodeOf(node)?.userObject as? Item.Project)?.project
+
+    /** Rewrites the project's .filters file with [edit], then reloads the tree and opens [expand]. */
+    private fun editFilters(prj: VcxProject, expand: DefaultMutableTreeNode?, edit: (ByteArray?) -> ByteArray) {
+        val filtersFile = prj.filtersFile
         try {
             FileDocumentManager.getInstance().saveAllDocuments()
             val vf = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(filtersFile)
             val original = if (vf != null) vf.contentsToByteArray() else FiltersEditor.read(filtersFile)
-            val updated = FiltersEditor.moveFiles(original, filtersFile, entries, filter)
+            val updated = edit(original)
             WriteAction.run<Exception> {
                 if (vf != null) vf.setBinaryContent(updated)
                 else java.nio.file.Files.write(filtersFile, updated)
@@ -308,8 +326,73 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
                 .createBalloon().showInCenterOf(tree)
             return
         }
-        pendingExpand += keyOf(target)
+        if (expand != null) pendingExpand += keyOf(expand)
         scheduleReload(0)
+    }
+
+    private fun selectedNode(): DefaultMutableTreeNode? = tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode
+
+    private fun validateFilterName(parent: DefaultMutableTreeNode, name: String, self: FilterDir?): String? {
+        val dirs = when (val i = parent.userObject) {
+            is Item.Project -> i.project.root.dirs
+            is Item.Dir -> i.dir.dirs
+            else -> return null
+        }
+        return when {
+            name.isBlank() -> "The name must not be empty"
+            name.any { it in "\\/:*?\"<>|" } -> "The name must not contain \\ / : * ? \" < > |"
+            dirs[name]?.let { it !== self } == true -> "A filter named '$name' already exists here"
+            else -> null
+        }
+    }
+
+    private fun newFilter() {
+        val node = selectedNode()?.takeIf { it.userObject is Item.Project || it.userObject is Item.Dir } ?: return
+        val prj = projectOf(node) ?: return
+        val parentPath = filterPathOf(node)
+        val name = Messages.showInputDialog(
+            project, "Filter name:", "New Filter", null, "",
+            object : InputValidator {
+                override fun checkInput(input: String) = validateFilterName(node, input.trim(), null) == null
+                override fun canClose(input: String) = checkInput(input)
+            },
+        )?.trim() ?: return
+        val full = if (parentPath.isEmpty()) name else "$parentPath\\$name"
+        editFilters(prj, expand = node) { FiltersEditor.addFilter(it, full) }
+    }
+
+    private fun renameFilter() {
+        val node = selectedNode()?.takeIf { it.userObject is Item.Dir } ?: return
+        val dir = (node.userObject as Item.Dir).dir
+        val parent = node.parent as DefaultMutableTreeNode
+        val prj = projectOf(node) ?: return
+        val old = filterPathOf(node)
+        val name = Messages.showInputDialog(
+            project, "New name for '${dir.name}':", "Rename Filter", null, dir.name,
+            object : InputValidator {
+                override fun checkInput(input: String) = validateFilterName(parent, input.trim(), dir) == null
+                override fun canClose(input: String) = checkInput(input)
+            },
+        )?.trim() ?: return
+        if (name == dir.name) return
+        val parentPath = filterPathOf(parent)
+        val new = if (parentPath.isEmpty()) name else "$parentPath\\$name"
+        editFilters(prj, expand = parent) { FiltersEditor.renameFilter(it, old, new) }
+    }
+
+    private fun removeFilter() {
+        val node = selectedNode()?.takeIf { it.userObject is Item.Dir } ?: return
+        val dir = (node.userObject as Item.Dir).dir
+        val prj = projectOf(node) ?: return
+        val where = if (filterPathOf(node.parent as DefaultMutableTreeNode).isEmpty()) "the project root" else "the parent filter"
+        val answer = Messages.showYesNoDialog(
+            project,
+            "Remove the filter '${dir.name}'? Its files and sub-filters move to $where. No files are deleted from disk.",
+            "Remove Filter", Messages.getQuestionIcon(),
+        )
+        if (answer != Messages.YES) return
+        val name = filterPathOf(node)
+        editFilters(prj, expand = node.parent as DefaultMutableTreeNode) { FiltersEditor.removeFilter(it, name) }
     }
 
     private inner class MoveHandler : TransferHandler() {
@@ -350,6 +433,20 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
         }
 
         override fun actionPerformed(e: AnActionEvent) = openSelected()
+    }
+
+    /** A popup action shown only when the selected node satisfies [applies]. */
+    private inner class NodeAction(
+        text: String, icon: Icon?, private val applies: (Item) -> Boolean, private val run: () -> Unit,
+    ) : AnAction(text, null, icon), DumbAware {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
+        override fun update(e: AnActionEvent) {
+            val item = selectedNode()?.userObject as? Item
+            e.presentation.isEnabledAndVisible = item != null && applies(item)
+        }
+
+        override fun actionPerformed(e: AnActionEvent) = run()
     }
 
     private inner class ItemRenderer : NodeRenderer() {
