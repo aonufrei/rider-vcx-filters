@@ -2,7 +2,11 @@ package com.example.vcxfilters.model
 
 import java.nio.file.Path
 
-class FileEntry(val path: Path, val exists: Boolean) {
+/**
+ * A file listed in a project. [itemType] (ClCompile, ClInclude, ...) and [include] (the raw Include attribute)
+ * are kept so the file can be re-created in the .filters file when it is moved to another filter.
+ */
+class FileEntry(val path: Path, val exists: Boolean, val itemType: String, val include: String) {
     val name: String get() = path.fileName?.toString() ?: path.toString()
 }
 
@@ -20,6 +24,12 @@ class FilterDir(val name: String) {
     }
 }
 
-class VcxProject(val name: String, val file: Path, val root: FilterDir)
+class VcxProject(val name: String, val file: Path, val root: FilterDir) {
+    /** The .vcxproj.filters file next to the project; it may not exist yet. */
+    val filtersFile: Path get() = file.resolveSibling(file.fileName.toString() + ".filters")
+}
 
-class VcxSolution(val name: String, val file: Path?, val projects: List<VcxProject>)
+/** [children] are solutions located in subdirectories of this solution's directory. */
+class VcxSolution(val name: String, val file: Path?, val projects: List<VcxProject>) {
+    val children = mutableListOf<VcxSolution>()
+}

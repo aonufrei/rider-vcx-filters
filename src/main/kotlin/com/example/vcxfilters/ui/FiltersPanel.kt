@@ -2,26 +2,38 @@ package com.example.vcxfilters.ui
 
 import com.example.vcxfilters.model.FileEntry
 import com.example.vcxfilters.model.FilterDir
+import com.example.vcxfilters.model.FiltersEditor
 import com.example.vcxfilters.model.VcxParser
 import com.example.vcxfilters.model.VcxProject
 import com.example.vcxfilters.model.VcxSolution
 import com.intellij.icons.AllIcons
+import com.intellij.ide.util.PropertiesComponent
 import com.intellij.ide.util.treeView.NodeRenderer
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.DefaultActionGroup
+import com.intellij.openapi.actionSystem.ToggleAction
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ModalityState
+import com.intellij.openapi.application.WriteAction
+import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.FileEditorManagerEvent
+import com.intellij.openapi.fileEditor.FileEditorManagerListener
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.DumbAware
 import com.intellij.openapi.project.Project
+import com.intellij.openapi.ui.MessageType
+import com.intellij.openapi.ui.SimpleToolWindowPanel
+import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.VirtualFileManager
 import com.intellij.openapi.vfs.newvfs.BulkFileListener
 import com.intellij.openapi.vfs.newvfs.events.VFileEvent
-import com.intellij.openapi.wm.ToolWindowManager
 import com.intellij.ui.PopupHandler
 import com.intellij.ui.ScrollPaneFactory
 import com.intellij.ui.SimpleTextAttributes
@@ -30,13 +42,18 @@ import com.intellij.ui.treeStructure.Tree
 import com.intellij.util.Alarm
 import com.intellij.util.IconUtil
 import com.intellij.util.ui.tree.TreeUtil
-import com.intellij.openapi.ui.SimpleToolWindowPanel
+import java.awt.datatransfer.DataFlavor
+import java.awt.datatransfer.StringSelection
+import java.awt.datatransfer.Transferable
 import java.awt.event.KeyAdapter
 import java.awt.event.KeyEvent
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.nio.file.Path
+import javax.swing.DropMode
+import javax.swing.JComponent
 import javax.swing.JTree
+import javax.swing.TransferHandler
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreePath
@@ -44,7 +61,7 @@ import javax.swing.tree.TreePath
 /** What a tree node represents. [key] identifies the node across reloads so expansion can be restored. */
 private sealed class Item(val key: String) {
     class Root : Item("")
-    class Solution(val sln: VcxSolution) : Item("sln:" + sln.name)
+    class Solution(val sln: VcxSolution, parentKey: String) : Item("$parentKey/sln:" + (sln.file ?: sln.name))
     class Project(val project: VcxProject, parentKey: String) : Item("$parentKey/prj:" + project.name)
     class Dir(val dir: FilterDir, parentKey: String) : Item("$parentKey/dir:" + dir.name)
     class File(val entry: FileEntry, parentKey: String) : Item("$parentKey/file:" + entry.name)
@@ -56,10 +73,21 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
     private val tree = Tree(model)
     private val alarm = Alarm(Alarm.ThreadToUse.POOLED_THREAD, this)
 
+    /** First tree node for each file path, used by "Select Opened File". */
+    private var fileNodes = HashMap<Path, DefaultMutableTreeNode>()
+    private val pendingExpand = HashSet<String>()
+    private var dragged: List<DefaultMutableTreeNode> = emptyList()
+    private var autoscroll: Boolean
+        get() = PropertiesComponent.getInstance(project).getBoolean(AUTOSCROLL_KEY, false)
+        set(v) = PropertiesComponent.getInstance(project).setValue(AUTOSCROLL_KEY, v, false)
+
     init {
         tree.isRootVisible = false
         tree.showsRootHandles = true
         tree.cellRenderer = ItemRenderer()
+        tree.dragEnabled = true
+        tree.dropMode = DropMode.ON
+        tree.transferHandler = MoveHandler()
         TreeSpeedSearch.installOn(tree, true) { path -> nodeText(path.lastPathComponent as DefaultMutableTreeNode) }
 
         tree.addMouseListener(object : MouseAdapter() {
@@ -77,12 +105,34 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
         setContent(ScrollPaneFactory.createScrollPane(tree))
         val group = DefaultActionGroup(
             object : AnAction("Refresh", "Re-read solutions and filters", AllIcons.Actions.Refresh), DumbAware {
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
                 override fun actionPerformed(e: AnActionEvent) = scheduleReload(0)
             },
+            object : AnAction("Select Opened File", "Locate the file open in the editor", AllIcons.General.Locate), DumbAware {
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
+                override fun actionPerformed(e: AnActionEvent) {
+                    val vf = FileEditorManager.getInstance(project).selectedFiles.firstOrNull()
+                    if (vf == null || !selectFile(vf)) {
+                        JBPopupFactory.getInstance()
+                            .createHtmlTextBalloonBuilder("The opened file is not part of any project in the tree", MessageType.INFO, null)
+                            .createBalloon().showInCenterOf(tree)
+                    }
+                }
+            },
+            object : ToggleAction("Always Select Opened File", "Follow the editor tab", AllIcons.General.AutoscrollFromSource), DumbAware {
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
+                override fun isSelected(e: AnActionEvent) = autoscroll
+                override fun setSelected(e: AnActionEvent, state: Boolean) {
+                    autoscroll = state
+                    if (state) FileEditorManager.getInstance(project).selectedFiles.firstOrNull()?.let { selectFile(it) }
+                }
+            },
             object : AnAction("Expand All", null, AllIcons.Actions.Expandall), DumbAware {
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
                 override fun actionPerformed(e: AnActionEvent) = TreeUtil.expandAll(tree)
             },
             object : AnAction("Collapse All", null, AllIcons.Actions.Collapseall), DumbAware {
+                override fun getActionUpdateThread() = ActionUpdateThread.EDT
                 override fun actionPerformed(e: AnActionEvent) {
                     TreeUtil.collapseAll(tree, 1)
                 }
@@ -92,9 +142,15 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
         toolbar.targetComponent = this
         setToolbar(toolbar.component)
 
-        project.messageBus.connect(this).subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
+        val connection = project.messageBus.connect(this)
+        connection.subscribe(VirtualFileManager.VFS_CHANGES, object : BulkFileListener {
             override fun after(events: List<VFileEvent>) {
                 if (events.any { isRelevant(it.path) }) scheduleReload(500)
+            }
+        })
+        connection.subscribe(FileEditorManagerListener.FILE_EDITOR_MANAGER, object : FileEditorManagerListener {
+            override fun selectionChanged(event: FileEditorManagerEvent) {
+                if (autoscroll) event.newFile?.let { selectFile(it) }
             }
         })
         scheduleReload(0)
@@ -115,34 +171,41 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
     }
 
     private fun rebuild(solutions: List<VcxSolution>) {
-        val expanded = HashSet<String>()
+        val expanded = HashSet<String>(pendingExpand)
+        pendingExpand.clear()
         for (i in 0 until tree.rowCount) {
             val path = tree.getPathForRow(i)
-            if (tree.isExpanded(path)) expanded += ((path.lastPathComponent as DefaultMutableTreeNode).userObject as Item).key
+            if (tree.isExpanded(path)) expanded += keyOf(path.lastPathComponent as DefaultMutableTreeNode)
         }
-        val selected = (tree.selectionPath?.lastPathComponent as? DefaultMutableTreeNode)?.let { (it.userObject as Item).key }
+        val selected = tree.selectionPaths?.map { keyOf(it.lastPathComponent as DefaultMutableTreeNode) }?.toSet().orEmpty()
         val firstLoad = root.childCount == 0
 
         root.removeAllChildren()
-        for (sln in solutions) {
-            val item = Item.Solution(sln)
-            val node = DefaultMutableTreeNode(item)
-            root.add(node)
-            for (prj in sln.projects) {
-                val pItem = Item.Project(prj, item.key)
-                val pNode = DefaultMutableTreeNode(pItem)
-                node.add(pNode)
-                fill(pNode, prj.root, pItem.key)
-            }
-        }
+        fileNodes = HashMap()
+        for (sln in solutions) addSolution(root, sln, "")
         model.reload()
 
         if (firstLoad) {
             // Default view: solutions and projects open, filters collapsed.
             TreeUtil.expand(tree, 2)
         } else {
-            restore(root, expanded, selected)
+            val toSelect = mutableListOf<TreePath>()
+            restore(root, expanded, selected, toSelect)
+            if (toSelect.isNotEmpty()) tree.selectionPaths = toSelect.toTypedArray()
         }
+    }
+
+    private fun addSolution(parent: DefaultMutableTreeNode, sln: VcxSolution, parentKey: String) {
+        val item = Item.Solution(sln, parentKey)
+        val node = DefaultMutableTreeNode(item)
+        parent.add(node)
+        for (prj in sln.projects) {
+            val pItem = Item.Project(prj, item.key)
+            val pNode = DefaultMutableTreeNode(pItem)
+            node.add(pNode)
+            fill(pNode, prj.root, pItem.key)
+        }
+        for (child in sln.children) addSolution(node, child, item.key)
     }
 
     private fun fill(parent: DefaultMutableTreeNode, dir: FilterDir, parentKey: String) {
@@ -153,17 +216,21 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
             fill(node, child, item.key)
         }
         for (f in dir.files.sortedBy { it.name.lowercase() }) {
-            parent.add(DefaultMutableTreeNode(Item.File(f, parentKey)))
+            val node = DefaultMutableTreeNode(Item.File(f, parentKey))
+            parent.add(node)
+            fileNodes.putIfAbsent(f.path, node)
         }
     }
 
-    private fun restore(node: DefaultMutableTreeNode, expanded: Set<String>, selected: String?) {
-        val key = (node.userObject as Item).key
+    private fun restore(node: DefaultMutableTreeNode, expanded: Set<String>, selected: Set<String>, out: MutableList<TreePath>) {
+        val key = keyOf(node)
         val path = TreePath(node.path)
         if (key in expanded) tree.expandPath(path)
-        if (key == selected && node !== root) tree.selectionPath = path
-        for (i in 0 until node.childCount) restore(node.getChildAt(i) as DefaultMutableTreeNode, expanded, selected)
+        if (key in selected && node !== root) out += path
+        for (i in 0 until node.childCount) restore(node.getChildAt(i) as DefaultMutableTreeNode, expanded, selected, out)
     }
+
+    private fun keyOf(node: DefaultMutableTreeNode) = (node.userObject as Item).key
 
     private fun nodeText(node: DefaultMutableTreeNode): String = when (val i = node.userObject) {
         is Item.Solution -> i.sln.name
@@ -182,7 +249,102 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
         OpenFileDescriptor(project, vf).navigate(true)
     }
 
+    /** Selects [vf] in the tree. Returns false when no project lists it. */
+    private fun selectFile(vf: VirtualFile): Boolean {
+        val path = try {
+            vf.toNioPath().normalize()
+        } catch (_: Exception) {
+            return false
+        }
+        val node = fileNodes[path] ?: return false
+        TreeUtil.selectPath(tree, TreePath(node.path))
+        return true
+    }
+
+    private fun projectNodeOf(node: DefaultMutableTreeNode): DefaultMutableTreeNode? {
+        var n: DefaultMutableTreeNode? = node
+        while (n != null && n.userObject !is Item.Project) n = n.parent as? DefaultMutableTreeNode
+        return n
+    }
+
+    /** Filter name of a Dir node ("A\B"), "" for the project node. */
+    private fun filterPathOf(node: DefaultMutableTreeNode): String {
+        val parts = mutableListOf<String>()
+        var n: DefaultMutableTreeNode? = node
+        while (n != null && n.userObject is Item.Dir) {
+            parts += (n.userObject as Item.Dir).dir.name
+            n = n.parent as? DefaultMutableTreeNode
+        }
+        return parts.asReversed().joinToString("\\")
+    }
+
+    /** Resolves what a drop on [node] means: files are dropped into the filter they sit in. */
+    private fun dropTarget(node: DefaultMutableTreeNode): DefaultMutableTreeNode? = when (node.userObject) {
+        is Item.Dir, is Item.Project -> node
+        is Item.File -> node.parent as? DefaultMutableTreeNode
+        else -> null
+    }
+
+    private fun moveFiles(files: List<DefaultMutableTreeNode>, target: DefaultMutableTreeNode) {
+        val prjNode = projectNodeOf(target) ?: return
+        val prj = (prjNode.userObject as Item.Project).project
+        val entries = files.map { (it.userObject as Item.File).entry }
+        val filter = filterPathOf(target)
+        val filtersFile = prj.filtersFile
+
+        try {
+            FileDocumentManager.getInstance().saveAllDocuments()
+            val vf = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(filtersFile)
+            val original = if (vf != null) vf.contentsToByteArray() else FiltersEditor.read(filtersFile)
+            val updated = FiltersEditor.moveFiles(original, filtersFile, entries, filter)
+            WriteAction.run<Exception> {
+                if (vf != null) vf.setBinaryContent(updated)
+                else java.nio.file.Files.write(filtersFile, updated)
+            }
+            if (vf == null) LocalFileSystem.getInstance().refreshAndFindFileByNioFile(filtersFile)
+        } catch (e: Exception) {
+            JBPopupFactory.getInstance()
+                .createHtmlTextBalloonBuilder("Could not update ${filtersFile.fileName}: ${e.message}", MessageType.ERROR, null)
+                .createBalloon().showInCenterOf(tree)
+            return
+        }
+        pendingExpand += keyOf(target)
+        scheduleReload(0)
+    }
+
+    private inner class MoveHandler : TransferHandler() {
+        override fun getSourceActions(c: JComponent) = MOVE
+
+        override fun createTransferable(c: JComponent): Transferable? {
+            val nodes = tree.selectionPaths?.map { it.lastPathComponent as DefaultMutableTreeNode }.orEmpty()
+            if (nodes.isEmpty() || nodes.any { it.userObject !is Item.File }) return null
+            // Moving between projects would mean editing two projects; only one at a time is supported.
+            if (nodes.map { projectNodeOf(it) }.distinct().size != 1) return null
+            dragged = nodes
+            return StringSelection(nodes.joinToString("\n") { (it.userObject as Item.File).entry.path.toString() })
+        }
+
+        override fun canImport(support: TransferSupport): Boolean {
+            if (!support.isDrop || !support.isDataFlavorSupported(DataFlavor.stringFlavor) || dragged.isEmpty()) return false
+            val path = (support.dropLocation as? JTree.DropLocation)?.path ?: return false
+            val target = dropTarget(path.lastPathComponent as DefaultMutableTreeNode) ?: return false
+            return projectNodeOf(target) === projectNodeOf(dragged.first())
+        }
+
+        override fun importData(support: TransferSupport): Boolean {
+            if (!canImport(support)) return false
+            val path = (support.dropLocation as JTree.DropLocation).path ?: return false
+            val target = dropTarget(path.lastPathComponent as DefaultMutableTreeNode) ?: return false
+            val files = dragged.filter { it.parent !== target }
+            dragged = emptyList()
+            if (files.isNotEmpty()) moveFiles(files, target)
+            return true
+        }
+    }
+
     private inner class OpenAction : AnAction("Open"), DumbAware {
+        override fun getActionUpdateThread() = ActionUpdateThread.EDT
+
         override fun update(e: AnActionEvent) {
             e.presentation.isEnabledAndVisible = selectedFile() != null
         }
@@ -222,4 +384,8 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
     }
 
     override fun dispose() {}
+
+    private companion object {
+        const val AUTOSCROLL_KEY = "vcxfilters.autoscroll"
+    }
 }

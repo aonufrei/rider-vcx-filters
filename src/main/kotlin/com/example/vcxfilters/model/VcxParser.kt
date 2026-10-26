@@ -2,8 +2,13 @@ package com.example.vcxfilters.model
 
 import org.w3c.dom.Element
 import org.w3c.dom.Node
+import java.io.IOException
+import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.ConcurrentHashMap
 import javax.xml.parsers.DocumentBuilderFactory
 
 object VcxParser {
@@ -17,35 +22,46 @@ object VcxParser {
 
     private val skippedDirs = setOf(".git", ".vs", ".idea", "node_modules", "build", "out", "bin", "obj")
 
-    fun findSolutions(root: Path, maxDepth: Int = 4): List<VcxSolution> {
+    /** Parsed projects are shared between solutions and only re-read when one of their files changes. */
+    private class Cached(val stamp: Long, val root: FilterDir)
+
+    private val cache = ConcurrentHashMap<Path, Cached>()
+
+    /** Finds every solution below [root] and nests each one under the closest solution in a parent directory. */
+    fun findSolutions(root: Path): List<VcxSolution> {
         val slns = mutableListOf<Path>()
         val projects = mutableListOf<Path>()
-        walk(root, maxDepth) { p ->
-            val n = p.fileName.toString().lowercase()
-            if (n.endsWith(".sln")) {
-                slns.add(p)
-            } else if (n.endsWith(".vcxproj")) {
-                projects.add(p)
+        Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
+                if (dir != root && dir.fileName.toString().lowercase() in skippedDirs) FileVisitResult.SKIP_SUBTREE
+                else FileVisitResult.CONTINUE
+
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                val n = file.fileName.toString().lowercase()
+                if (n.endsWith(".sln")) slns.add(file) else if (n.endsWith(".vcxproj")) projects.add(file)
+                return FileVisitResult.CONTINUE
             }
+
+            override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult = FileVisitResult.CONTINUE
+        })
+
+        if (slns.isEmpty()) {
+            return if (projects.isEmpty()) emptyList()
+            else listOf(VcxSolution("(no solution)", null, projects.sorted().mapNotNull { parseProject(it, null) }))
         }
-        val result = slns.sorted().map { parseSolution(it) }.toMutableList()
-        if (result.isEmpty() && projects.isNotEmpty()) {
-            result += VcxSolution("(no solution)", null, projects.sorted().mapNotNull { parseProject(it, null) })
-        }
-        return result
+        return nest(slns.sorted().map { parseSolution(it) })
     }
 
-    private fun walk(dir: Path, depth: Int, visit: (Path) -> Unit) {
-        val entries = try {
-            Files.newDirectoryStream(dir).use { it.toList() }
-        } catch (_: Exception) {
-            return
+    private fun nest(all: List<VcxSolution>): List<VcxSolution> {
+        val roots = mutableListOf<VcxSolution>()
+        for (s in all) {
+            val dir = s.file!!.parent
+            val parent = all
+                .filter { c -> c !== s && c.file!!.parent != dir && dir.startsWith(c.file.parent) }
+                .maxByOrNull { it.file!!.parent.nameCount }
+            if (parent == null) roots += s else parent.children += s
         }
-        for (p in entries) {
-            if (Files.isDirectory(p)) {
-                if (depth > 0 && p.fileName.toString().lowercase() !in skippedDirs) walk(p, depth - 1, visit)
-            } else visit(p)
-        }
+        return roots
     }
 
     fun parseSolution(sln: Path): VcxSolution {
@@ -65,39 +81,46 @@ object VcxParser {
     }
 
     fun parseProject(vcxproj: Path, name: String?): VcxProject? {
-        val dir = vcxproj.parent
+        val displayName = name ?: vcxproj.fileName.toString().removeSuffix(".vcxproj")
+        val filtersFile = vcxproj.resolveSibling(vcxproj.fileName.toString() + ".filters")
+        val stamp = mtime(vcxproj) * 31 + mtime(filtersFile)
+        cache[vcxproj]?.let { if (it.stamp == stamp) return VcxProject(displayName, vcxproj, it.root) }
+
         val root = FilterDir("")
+        val dir = vcxproj.parent
         val placed = HashSet<Path>()
 
-        fun add(include: String, filter: String?) {
+        fun add(item: Element, filter: String?) {
+            val include = item.getAttribute("Include")
             if ('*' in include || '?' in include) return
             val file = dir.resolve(include.replace('\\', '/')).normalize()
             if (!placed.add(file)) return
             val target = if (filter.isNullOrBlank()) root else root.child(filter)
-            target.files += FileEntry(file, Files.exists(file))
+            target.files += FileEntry(file, Files.exists(file), item.tagName, include)
         }
 
         try {
-            val filtersFile = vcxproj.resolveSibling(vcxproj.fileName.toString() + ".filters")
             if (Files.isRegularFile(filtersFile)) {
                 for (item in itemElements(filtersFile)) {
-                    val include = item.getAttribute("Include")
-                    if (item.tagName == "Filter") {
-                        root.child(include)
-                    } else {
-                        add(include, childText(item, "Filter"))
-                    }
+                    if (item.tagName == "Filter") root.child(item.getAttribute("Include"))
+                    else add(item, childText(item, "Filter"))
                 }
             }
             // Files that the .filters file does not mention live in the project root, as in Visual Studio.
             for (item in itemElements(vcxproj)) {
-                if (item.tagName in nonFileItems) continue
-                add(item.getAttribute("Include"), null)
+                if (item.tagName !in nonFileItems) add(item, null)
             }
         } catch (_: Exception) {
             return null
         }
-        return VcxProject(name ?: vcxproj.fileName.toString().removeSuffix(".vcxproj"), vcxproj, root)
+        cache[vcxproj] = Cached(stamp, root)
+        return VcxProject(displayName, vcxproj, root)
+    }
+
+    private fun mtime(p: Path): Long = try {
+        Files.getLastModifiedTime(p).toMillis()
+    } catch (_: IOException) {
+        0L
     }
 
     private fun itemElements(xml: Path): List<Element> {
