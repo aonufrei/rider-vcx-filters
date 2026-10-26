@@ -1,0 +1,40 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only used to attach the zip to a release when a v* tag is pushed
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      # Caches Gradle and the downloaded Rider SDK between runs.
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build plugin
+        run: ./gradlew buildPlugin --console=plain
+
+      - name: Upload plugin zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: rider-vcxproj-filters
+          path: build/distributions/*.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" build/distributions/*.zip --title "$GITHUB_REF_NAME" --generate-notes
