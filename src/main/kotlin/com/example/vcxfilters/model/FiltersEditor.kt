@@ -60,6 +60,8 @@ object FiltersEditor {
         edit(original) { doc, project ->
             rewritePrefix(project, oldName, newName)
             removeDuplicateFilters(project)
+            // A filter that was only implied by its files' names needs a definition once it is moved.
+            ensureFilter(doc, project, newName.trim('\\'))
         }
 
     /**

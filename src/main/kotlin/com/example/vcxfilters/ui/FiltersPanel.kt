@@ -304,6 +304,26 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
         editFilters(prj, expand = target) { FiltersEditor.moveFiles(it, prj.filtersFile, entries, filter) }
     }
 
+    /** Sub-filters of a Project or Dir node, keyed case-insensitively. */
+    private fun childDirs(node: DefaultMutableTreeNode): Map<String, FilterDir> = when (val i = node.userObject) {
+        is Item.Project -> i.project.root.dirs
+        is Item.Dir -> i.dir.dirs
+        else -> emptyMap()
+    }
+
+    private fun moveFilters(dirs: List<DefaultMutableTreeNode>, target: DefaultMutableTreeNode) {
+        val prj = projectOf(target) ?: return
+        val targetPath = filterPathOf(target)
+        val moves = dirs.map { filterPathOf(it) to (it.userObject as Item.Dir).dir.name }
+        editFilters(prj, expand = target) { original ->
+            var bytes = original
+            for ((old, name) in moves) {
+                bytes = FiltersEditor.renameFilter(bytes, old, if (targetPath.isEmpty()) name else "$targetPath\\$name")
+            }
+            bytes!!
+        }
+    }
+
     private fun projectOf(node: DefaultMutableTreeNode): VcxProject? =
         (projectNodeOf(node)?.userObject as? Item.Project)?.project
 
@@ -400,28 +420,42 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
 
         override fun createTransferable(c: JComponent): Transferable? {
             val nodes = tree.selectionPaths?.map { it.lastPathComponent as DefaultMutableTreeNode }.orEmpty()
-            if (nodes.isEmpty() || nodes.any { it.userObject !is Item.File }) return null
+            val files = nodes.all { it.userObject is Item.File }
+            if (nodes.isEmpty() || !(files || nodes.all { it.userObject is Item.Dir })) return null
             // Moving between projects would mean editing two projects; only one at a time is supported.
             if (nodes.map { projectNodeOf(it) }.distinct().size != 1) return null
-            dragged = nodes
-            return StringSelection(nodes.joinToString("\n") { (it.userObject as Item.File).entry.path.toString() })
+            // A filter dragged together with one of its parents moves along with that parent.
+            dragged = if (files) nodes else nodes.filter { n -> nodes.none { o -> o !== n && n.isNodeAncestor(o) } }
+            return StringSelection(dragged.joinToString("\n") { nodeText(it) })
         }
 
         override fun canImport(support: TransferSupport): Boolean {
             if (!support.isDrop || !support.isDataFlavorSupported(DataFlavor.stringFlavor) || dragged.isEmpty()) return false
             val path = (support.dropLocation as? JTree.DropLocation)?.path ?: return false
             val target = dropTarget(path.lastPathComponent as DefaultMutableTreeNode) ?: return false
-            return projectNodeOf(target) === projectNodeOf(dragged.first())
+            if (projectNodeOf(target) !== projectNodeOf(dragged.first())) return false
+            if (dragged.first().userObject is Item.File) return true
+
+            // Filters cannot move into themselves, must have a free name there, and must actually change place.
+            if (dragged.any { it === target || target.isNodeAncestor(it) }) return false
+            val movable = dragged.filter { it.parent !== target }
+            val names = movable.map { (it.userObject as Item.Dir).dir.name.lowercase() }
+            return movable.isNotEmpty() && names.distinct().size == names.size && names.none { childDirs(target).containsKey(it) }
         }
 
         override fun importData(support: TransferSupport): Boolean {
             if (!canImport(support)) return false
             val path = (support.dropLocation as JTree.DropLocation).path ?: return false
             val target = dropTarget(path.lastPathComponent as DefaultMutableTreeNode) ?: return false
-            val files = dragged.filter { it.parent !== target }
+            val nodes = dragged.filter { it.parent !== target }
             dragged = emptyList()
-            if (files.isNotEmpty()) moveFiles(files, target)
+            if (nodes.isEmpty()) return true
+            if (nodes.first().userObject is Item.File) moveFiles(nodes, target) else moveFilters(nodes, target)
             return true
+        }
+
+        override fun exportDone(source: JComponent, data: Transferable?, action: Int) {
+            dragged = emptyList()
         }
     }
 
