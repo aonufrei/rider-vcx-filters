@@ -589,7 +589,8 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
             val path = (support.dropLocation as? JTree.DropLocation)?.path ?: return false
             val target = dropTarget(path.lastPathComponent as DefaultMutableTreeNode) ?: return false
             if (projectNodeOf(target) !== projectNodeOf(dragged.first())) return false
-            if (dragged.first().userObject is Item.File) return true
+            // Dropping files into the filter they are already in does nothing, so it must not look like a valid drop.
+            if (dragged.first().userObject is Item.File) return dragged.any { it.parent !== target }
 
             // Filters cannot move into themselves, must have a free name there, and must actually change place.
             if (dragged.any { it === target || target.isNodeAncestor(it) }) return false
@@ -611,6 +612,8 @@ class FiltersPanel(private val project: Project) : SimpleToolWindowPanel(true, t
 
         override fun exportDone(source: JComponent, data: Transferable?, action: Int) {
             dragged = emptyList()
+            // A rejected or cancelled drop leaves the drop highlight painted until the tree repaints.
+            tree.repaint()
         }
     }
 
